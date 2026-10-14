@@ -67,7 +67,12 @@ type Ipamer interface {
 	ListNamespaces(ctx context.Context) ([]string, error)
 	// DeleteNamespaces deletes the namespace with the given name.
 	// Any namespace provided in the context is ignored for this operation.
-	// It not idempotent, so attempts to delete a namespace which does not exist will return an error.
+	// It is not idempotent, so attempts to delete a namespace which does not
+	// exist will return ErrNamespaceDoesNotExist. The operation is an atomic
+	// lifecycle transition: deleting a namespace which still contains prefixes
+	// returns ErrNamespaceNotEmpty and keeps the prefixes, while prefix
+	// creation after a committed deletion returns ErrNamespaceDoesNotExist
+	// until the namespace is explicitly recreated with CreateNamespace.
 	DeleteNamespace(ctx context.Context, namespace string) error
 }
 

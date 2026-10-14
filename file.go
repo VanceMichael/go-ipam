@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -18,12 +19,23 @@ type file struct {
 	// prettyJSON is always true, but up for being configurable
 	prettyJSON bool
 	// modTime helps with tracking external file changes
-	// usages of modTime will be deprecated after implementing filesystem-level locking
 	modTime time.Time
 	// parent implements internal state management, currently it is always NewMemory()
 	parent Storage
-	// lock at some point should be replaced with filesystem lock
-	lock sync.RWMutex
+	// lock serializes operations within this instance. Every operation,
+	// including reads, reloads the local cache from disk, so the lock is
+	// always taken exclusively.
+	lock sync.Mutex
+	// lockFile is the handle of the sidecar lock file. An exclusive flock on
+	// it serializes independent instances (different processes, or different
+	// opens in the same process) that share one state file, turning the
+	// reload -> mutate -> persist sequence into a cross-instance atomic step.
+	lockFile *os.File
+	// commitFile durably commits serialized state to the state file. It is a
+	// field so tests can inject physical storage failures; the production
+	// implementation writes a temporary file and atomically renames it over
+	// the state file.
+	commitFile func(path string, data []byte) error
 }
 
 var (
@@ -57,15 +69,128 @@ func getXDGDataHome() string {
 	return val
 }
 
-// NewLocalFile creates a JSON file storage for ipam
-func NewLocalFile(ctx context.Context, path string) Storage {
-	return &file{
-		path:       path,
+// newFile constructs a file storage and prepares the sidecar flock file.
+func newFile(ctx context.Context, filePath string) (*file, error) {
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o700); err != nil {
+		return nil, fmt.Errorf("unable to create state directory for %q: %w", filePath, err)
+	}
+	lockHandle, err := os.OpenFile(filePath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("unable to open state lock file %q: %w", filePath+".lock", err)
+	}
+	f := &file{
+		path:       filePath,
 		prettyJSON: true,
 		parent:     NewMemory(ctx),
 		modTime:    nullModTime,
-		lock:       sync.RWMutex{},
+		lockFile:   lockHandle,
 	}
+	f.commitFile = f.writeAndRename
+	return f, nil
+}
+
+// writeAndRename commits state durably by writing a sidecar temp file and
+// atomically renaming it over the state file. A crash or a failing write can
+// therefore never leave a truncated or half-written state file behind.
+func (f *file) writeAndRename(filePath string, data []byte) (err error) {
+	tmp := filePath + ".tmp"
+	if err = os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmp)
+		}
+	}()
+	return os.Rename(tmp, filePath)
+}
+
+// NewLocalFile creates a JSON file storage for ipam
+func NewLocalFile(ctx context.Context, filePath string) Storage {
+	f, err := newFile(ctx, filePath)
+	if err != nil {
+		// Construction never failed historically; degrade to in-process
+		// serialization only and let the first operation surface the
+		// underlying filesystem problem.
+		f = &file{
+			path:       filePath,
+			prettyJSON: true,
+			parent:     NewMemory(ctx),
+			modTime:    nullModTime,
+		}
+		f.commitFile = f.writeAndRename
+	}
+	return f
+}
+
+// begin enters the cross-instance exclusive critical section.
+func (f *file) begin() error {
+	if f.lockFile != nil {
+		if err := lockFileExclusive(f.lockFile); err != nil {
+			return fmt.Errorf("unable to lock state file %q: %w", f.path, err)
+		}
+	}
+	f.lock.Lock()
+	return nil
+}
+
+// end leaves the cross-instance exclusive critical section.
+func (f *file) end() {
+	f.lock.Unlock()
+	if f.lockFile != nil {
+		_ = unlockFile(f.lockFile)
+	}
+}
+
+// view serializes a read against cross-instance writers and makes the local
+// cache reflect the durable state before answering.
+func (f *file) view(ctx context.Context, read func() error) error {
+	if err := f.begin(); err != nil {
+		return err
+	}
+	defer f.end()
+	if err := f.reload(ctx); err != nil {
+		return err
+	}
+	return read()
+}
+
+// commit serializes a state-mutating operation: reload from disk, apply the
+// change to the local cache, then durably persist the whole cache.
+//
+// If the physical commit fails, the local cache is resynchronized from disk,
+// so after success, conflict, timeout or partial failure the local cache can
+// never diverge from the durable state.
+func (f *file) commit(ctx context.Context, mutate func() error) error {
+	if err := f.begin(); err != nil {
+		return err
+	}
+	defer f.end()
+
+	if err := f.reload(ctx); err != nil {
+		return err
+	}
+	if err := mutate(); err != nil {
+		// The cache rejecting the transition (e.g. non-empty namespace)
+		// never mutated any state, so nothing has to be rolled back.
+		return err
+	}
+	if err := f.persist(ctx); err != nil {
+		if syncErr := f.resync(ctx); syncErr != nil {
+			// The original error is what the caller must act on; the resync
+			// failure is attached for observability.
+			return fmt.Errorf("%w (cache resync after failed persist also failed: %v)", err, syncErr)
+		}
+		return err
+	}
+	return nil
+}
+
+// resync forces the next reload to rebuild the local cache from the durable
+// state file, regardless of the previously observed modification time.
+func (f *file) resync(ctx context.Context) error {
+	f.modTime = nullModTime
+	return f.reload(ctx)
 }
 
 // clearParent() empties the internal state
@@ -178,130 +303,97 @@ func (f *file) persist(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("failed to serialize JSON: %w", err)
 	}
-	err = os.WriteFile(f.path, data, 0600)
-	if err != nil {
+	if err = f.commitFile(f.path, data); err != nil {
 		return fmt.Errorf("error storing state at %q: %w", f.path, err)
 	}
 	f.modTime = f.getModTime()
-	return err
+	return nil
 }
 func (f *file) Name() string {
 	return "file"
 }
 
 func (f *file) CreatePrefix(ctx context.Context, prefix Prefix, namespace string) (p Prefix, err error) {
-	f.lock.Lock()
-	defer f.lock.Unlock()
-
-	if err = f.reload(ctx); err != nil {
-		return p, err
-	}
-
-	if p, err = f.parent.CreatePrefix(ctx, prefix, namespace); err != nil {
-		return p, err
-	}
-
-	return p, f.persist(ctx)
+	err = f.commit(ctx, func() error {
+		var applyErr error
+		p, applyErr = f.parent.CreatePrefix(ctx, prefix, namespace)
+		return applyErr
+	})
+	return p, err
 }
 
 func (f *file) ReadPrefix(ctx context.Context, prefix, namespace string) (p Prefix, err error) {
-	f.lock.RLock()
-	defer f.lock.RUnlock()
-	if err = f.reload(ctx); err != nil {
-		return p, err
-	}
-	return f.parent.ReadPrefix(ctx, prefix, namespace)
+	err = f.view(ctx, func() error {
+		var readErr error
+		p, readErr = f.parent.ReadPrefix(ctx, prefix, namespace)
+		return readErr
+	})
+	return p, err
 }
 
-func (f *file) DeleteAllPrefixes(ctx context.Context, namespace string) (err error) {
-	f.lock.RLock()
-	defer f.lock.RUnlock()
-
-	if err = f.reload(ctx); err != nil {
-		return err
-	}
-	if err = f.parent.DeleteAllPrefixes(ctx, namespace); err != nil {
-		return err
-	}
-	return f.persist(ctx)
+func (f *file) DeleteAllPrefixes(ctx context.Context, namespace string) error {
+	return f.commit(ctx, func() error {
+		return f.parent.DeleteAllPrefixes(ctx, namespace)
+	})
 }
 
 func (f *file) ReadAllPrefixes(ctx context.Context, namespace string) (ps Prefixes, err error) {
-	f.lock.RLock()
-	defer f.lock.RUnlock()
-
-	if err = f.reload(ctx); err != nil {
-		return ps, err
-	}
-	return f.parent.ReadAllPrefixes(ctx, namespace)
+	err = f.view(ctx, func() error {
+		var readErr error
+		ps, readErr = f.parent.ReadAllPrefixes(ctx, namespace)
+		return readErr
+	})
+	return ps, err
 }
 
 func (f *file) ReadAllPrefixCidrs(ctx context.Context, namespace string) (cidrs []string, err error) {
-	f.lock.RLock()
-	defer f.lock.RUnlock()
-
-	if err = f.reload(ctx); err != nil {
-		return cidrs, err
-	}
-	return f.parent.ReadAllPrefixCidrs(ctx, namespace)
+	err = f.view(ctx, func() error {
+		var readErr error
+		cidrs, readErr = f.parent.ReadAllPrefixCidrs(ctx, namespace)
+		return readErr
+	})
+	return cidrs, err
 }
 
 func (f *file) UpdatePrefix(ctx context.Context, prefix Prefix, namespace string) (p Prefix, err error) {
-	f.lock.Lock()
-	defer f.lock.Unlock()
-
-	if err = f.reload(ctx); err != nil {
-		return p, err
-	}
-	if p, err = f.parent.UpdatePrefix(ctx, prefix, namespace); err != nil {
-		return p, err
-	}
-	return p, f.persist(ctx)
+	err = f.commit(ctx, func() error {
+		var applyErr error
+		p, applyErr = f.parent.UpdatePrefix(ctx, prefix, namespace)
+		return applyErr
+	})
+	return p, err
 }
+
 func (f *file) DeletePrefix(ctx context.Context, prefix Prefix, namespace string) (p Prefix, err error) {
-	f.lock.Lock()
-	defer f.lock.Unlock()
-
-	if err = f.reload(ctx); err != nil {
-		return p, err
-	}
-	if p, err = f.parent.DeletePrefix(ctx, prefix, namespace); err != nil {
-		return p, err
-	}
-	return p, f.persist(ctx)
+	err = f.commit(ctx, func() error {
+		var applyErr error
+		p, applyErr = f.parent.DeletePrefix(ctx, prefix, namespace)
+		return applyErr
+	})
+	return p, err
 }
 
-func (f *file) CreateNamespace(ctx context.Context, namespace string) (err error) {
-	f.lock.Lock()
-	defer f.lock.Unlock()
-
-	if err = f.reload(ctx); err != nil {
-		return err
-	}
-	if err = f.parent.CreateNamespace(ctx, namespace); err != nil {
-		return err
-	}
-	return f.persist(ctx)
+func (f *file) CreateNamespace(ctx context.Context, namespace string) error {
+	return f.commit(ctx, func() error {
+		return f.parent.CreateNamespace(ctx, namespace)
+	})
 }
 
 func (f *file) ListNamespaces(ctx context.Context) (result []string, err error) {
-	f.lock.Lock()
-	defer f.lock.Unlock()
-	if err = f.reload(ctx); err != nil {
-		return result, err
-	}
-	return f.parent.ListNamespaces(ctx)
+	err = f.view(ctx, func() error {
+		var readErr error
+		result, readErr = f.parent.ListNamespaces(ctx)
+		return readErr
+	})
+	return result, err
 }
 
-func (f *file) DeleteNamespace(ctx context.Context, namespace string) (err error) {
-	f.lock.Lock()
-	defer f.lock.Unlock()
-
-	if err = f.reload(ctx); err != nil {
-		return err
-	}
-	if err = f.parent.DeleteNamespace(ctx, namespace); err != nil {
-		return err
-	}
-	return f.persist(ctx)
+// DeleteNamespace runs the guarded parent transition inside the cross-instance
+// critical section: a CreatePrefix committing on another instance is either
+// visible to the emptiness check (ErrNamespaceNotEmpty, prefix retained) or
+// happens only after the persisted removal (ErrNamespaceDoesNotExist).
+func (f *file) DeleteNamespace(ctx context.Context, namespace string) error {
+	return f.commit(ctx, func() error {
+		return f.parent.DeleteNamespace(ctx, namespace)
+	})
 }

@@ -50,8 +50,8 @@ func (m *memory) ReadPrefix(_ context.Context, prefix, namespace string) (Prefix
 }
 
 func (m *memory) DeleteAllPrefixes(_ context.Context, namespace string) error {
-	m.lock.RLock()
-	defer m.lock.RUnlock()
+	m.lock.Lock()
+	defer m.lock.Unlock()
 	m.prefixes[namespace] = make(map[string]Prefix)
 	return nil
 }
@@ -139,9 +139,19 @@ func (m *memory) ListNamespaces(_ context.Context) ([]string, error) {
 	return result, nil
 }
 
+// DeleteNamespace performs the atomic emptiness check and directory removal
+// under the single write lock, so a concurrent CreatePrefix either commits
+// before the check (delete fails with ErrNamespaceNotEmpty) or observes the
+// missing namespace afterwards (ErrNamespaceDoesNotExist).
 func (m *memory) DeleteNamespace(_ context.Context, namespace string) error {
-	if _, ok := m.prefixes[namespace]; !ok {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	prefixes, ok := m.prefixes[namespace]
+	if !ok {
 		return ErrNamespaceDoesNotExist
+	}
+	if len(prefixes) > 0 {
+		return errNamespaceHasPrefixes
 	}
 	delete(m.prefixes, namespace)
 	return nil

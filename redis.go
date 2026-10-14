@@ -11,6 +11,49 @@ import (
 
 const namespaceKey = "namespaces"
 
+// Return codes shared by the lifecycle Lua scripts.
+const (
+	redisLuaOK               = 0
+	redisLuaNamespaceMissing = -1
+	redisLuaPrefixExists     = -2
+)
+
+// createPrefixScript atomically gates prefix creation on namespace
+// membership, so a committed DeleteNamespace makes a concurrent create fail
+// with redisLuaNamespaceMissing instead of resurrecting the prefix hash.
+//
+// KEYS[1]: namespaces set, KEYS[2]: prefix hash of the namespace
+// ARGV[1]: namespace, ARGV[2]: cidr, ARGV[3]: serialized prefix
+var createPrefixScript = redigo.NewScript(`
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
+	return -1
+end
+if redis.call('HEXISTS', KEYS[2], ARGV[2]) == 1 then
+	return -2
+end
+redis.call('HSET', KEYS[2], ARGV[2], ARGV[3])
+return 0
+`)
+
+// deleteNamespaceScript is the single-step atomic lifecycle transition:
+// membership check + emptiness check + directory/resource removal execute
+// without any other command being able to interleave (Redis runs scripts
+// atomically).
+//
+// KEYS[1]: namespaces set, KEYS[2]: prefix hash of the namespace
+// ARGV[1]: namespace
+var deleteNamespaceScript = redigo.NewScript(`
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
+	return -1
+end
+if redis.call('HLEN', KEYS[2]) ~= 0 then
+	return -2
+end
+redis.call('SREM', KEYS[1], ARGV[1])
+redis.call('DEL', KEYS[2])
+return 0
+`)
+
 type redis struct {
 	rdb        *redigo.Client
 	namespaces map[string]struct{}
@@ -62,25 +105,34 @@ func (r *redis) CreatePrefix(ctx context.Context, prefix Prefix, namespace strin
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
-	if err := r.checkNamespaceExists(ctx, namespace); err != nil {
-		return Prefix{}, err
-	}
-
-	existing, err := r.rdb.HExists(ctx, namespace, prefix.Cidr).Result()
-	if err != nil {
-		return Prefix{}, fmt.Errorf("unable to read existing prefix:%v, error:%w", prefix, err)
-	}
-	if existing {
-		return Prefix{}, fmt.Errorf("prefix:%v already exists", prefix)
-	}
 	pfx, err := prefix.toJSON()
 	if err != nil {
 		return Prefix{}, err
 	}
-	if err = r.rdb.HSet(ctx, namespace, prefix.Cidr, pfx).Err(); err != nil {
-		return Prefix{}, err
+
+	// The membership decision happens server-side inside the script, so it
+	// is linearizable with deleteNamespaceScript even across independent
+	// clients sharing this Redis.
+	result, err := createPrefixScript.Run(ctx, r.rdb,
+		[]string{namespaceKey, namespace},
+		namespace, prefix.Cidr, pfx,
+	).Int64()
+	if err != nil {
+		return Prefix{}, fmt.Errorf("unable to create prefix:%v, error:%w", prefix, err)
 	}
-	return prefix, err
+	switch result {
+	case redisLuaOK:
+		return prefix, nil
+	case redisLuaNamespaceMissing:
+		// A concurrent delete committed: make sure a stale positive cache
+		// entry cannot hide that fact from this client.
+		delete(r.namespaces, namespace)
+		return Prefix{}, ErrNamespaceDoesNotExist
+	case redisLuaPrefixExists:
+		return Prefix{}, fmt.Errorf("prefix:%v already exists", prefix)
+	default:
+		return Prefix{}, fmt.Errorf("unexpected create prefix result:%d", result)
+	}
 }
 func (r *redis) ReadPrefix(ctx context.Context, prefix, namespace string) (Prefix, error) {
 	r.lock.RLock()
@@ -98,8 +150,8 @@ func (r *redis) ReadPrefix(ctx context.Context, prefix, namespace string) (Prefi
 }
 
 func (r *redis) DeleteAllPrefixes(ctx context.Context, namespace string) error {
-	r.lock.RLock()
-	defer r.lock.RUnlock()
+	r.lock.Lock()
+	defer r.lock.Unlock()
 	if err := r.checkNamespaceExists(ctx, namespace); err != nil {
 		return err
 	}
@@ -162,6 +214,16 @@ func (r *redis) UpdatePrefix(ctx context.Context, prefix Prefix, namespace strin
 	}
 
 	txf := func(tx *redigo.Tx) error {
+		// Re-check membership inside the watched transaction: a concurrent
+		// DeleteNamespace either removes the set membership or deletes the
+		// prefix hash, both of which abort this transaction.
+		member, err := tx.SIsMember(ctx, namespaceKey, namespace).Result()
+		if err != nil {
+			return err
+		}
+		if !member {
+			return ErrNamespaceDoesNotExist
+		}
 		// Get current value or zero.
 		p, err := tx.HGet(ctx, namespace, prefix.Cidr).Result()
 		if err != nil && !errors.Is(err, redigo.Nil) {
@@ -183,8 +245,19 @@ func (r *redis) UpdatePrefix(ctx context.Context, prefix Prefix, namespace strin
 		})
 		return err
 	}
-	err = r.rdb.Watch(ctx, txf, namespace)
+	// Watch both the prefix hash and the namespace directory: the delete
+	// transition modifies both (DEL hash, SREM set).
+	err = r.rdb.Watch(ctx, txf, namespace, namespaceKey)
 	if err != nil {
+		if errors.Is(err, redigo.TxFailedErr) {
+			// Concurrent namespace deletion or another committer changed a
+			// watched key; surface as optimistic lock conflict so callers can
+			// re-read and retry.
+			return Prefix{}, fmt.Errorf("%w: unable to update prefix:%s", ErrOptimisticLockError, prefix.Cidr)
+		}
+		if errors.Is(err, ErrNamespaceDoesNotExist) {
+			delete(r.namespaces, namespace)
+		}
 		return Prefix{}, err
 	}
 
@@ -225,15 +298,33 @@ func (r *redis) ListNamespaces(ctx context.Context) ([]string, error) {
 	return r.rdb.SMembers(ctx, namespaceKey).Result()
 }
 
+// DeleteNamespace executes the emptiness check and the directory/resource
+// removal in a single server-side Lua transaction. Independent clients can
+// never observe the two steps as separated, so create and delete can not both
+// succeed.
 func (r *redis) DeleteNamespace(ctx context.Context, namespace string) error {
-	if err := r.DeleteAllPrefixes(ctx, namespace); err != nil {
-		return err
-	}
 	r.lock.Lock()
 	defer r.lock.Unlock()
-	if err := r.rdb.SRem(ctx, namespaceKey, namespace).Err(); err != nil {
-		return err
+
+	result, err := deleteNamespaceScript.Run(ctx, r.rdb,
+		[]string{namespaceKey, namespace},
+		namespace,
+	).Int64()
+	if err != nil {
+		return fmt.Errorf("unable to delete namespace:%s, error:%w", namespace, err)
 	}
-	delete(r.namespaces, namespace)
-	return nil
+	switch result {
+	case redisLuaOK:
+		// Commit observed: drop the positive cache entry.
+		delete(r.namespaces, namespace)
+		return nil
+	case redisLuaNamespaceMissing:
+		delete(r.namespaces, namespace)
+		return ErrNamespaceDoesNotExist
+	case redisLuaPrefixExists:
+		// Conflict outcome: a create committed first, everything is retained.
+		return errNamespaceHasPrefixes
+	default:
+		return fmt.Errorf("unexpected delete namespace result:%d", result)
+	}
 }

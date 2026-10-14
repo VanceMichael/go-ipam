@@ -566,14 +566,15 @@ func (i *ipamer) ListNamespaces(ctx context.Context) ([]string, error) {
 }
 
 // DeleteNamespace deletes a namespace.
+//
+// The emptiness decision and the removal of the namespace directory and its
+// prefix resources are a single atomic storage transition: a CreatePrefix
+// that commits first makes this call fail with ErrNamespaceNotEmpty and the
+// new prefix is retained, while a CreatePrefix arriving after this call
+// committed fails with ErrNamespaceDoesNotExist until CreateNamespace
+// explicitly rebuilds the namespace. Both outcomes can never be observed as
+// successful at the same time.
 func (i *ipamer) DeleteNamespace(ctx context.Context, namespace string) error {
-	prefixes, err := i.storage.ReadAllPrefixes(ctx, namespace)
-	if err != nil {
-		return err
-	}
-	if len(prefixes) > 0 {
-		return fmt.Errorf("cannot delete namespace with allocated prefixes")
-	}
 	return i.storage.DeleteNamespace(ctx, namespace)
 }
 

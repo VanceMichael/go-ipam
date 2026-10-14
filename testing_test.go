@@ -358,13 +358,7 @@ func newLocalFileWithCleanup(ctx context.Context) (*file, error) {
 		return nil, err
 	}
 
-	return &file{
-		path:       fp.Name(),
-		prettyJSON: true,
-		parent:     NewMemory(ctx),
-		modTime:    nullModTime,
-		lock:       sync.RWMutex{},
-	}, nil
+	return newFile(ctx, fp.Name())
 }
 
 func newPostgresWithCleanup(ctx context.Context) (*extendedSQL, error) {
@@ -464,8 +458,10 @@ func (f *file) postCleanup(ctx context.Context) error {
 // cleanup database before test
 func (e *extendedSQL) cleanup(ctx context.Context) error {
 	tx := e.db.MustBegin()
-	_, err := e.db.Exec("TRUNCATE TABLE prefixes")
-	if err != nil {
+	if _, err := e.db.Exec("TRUNCATE TABLE prefixes"); err != nil {
+		return err
+	}
+	if _, err := e.db.Exec("UPDATE namespaces SET prefix_count = 0 WHERE name = $1", defaultNamespace); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -484,8 +480,10 @@ func (kv *kvEtcdStorage) cleanup(ctx context.Context) error {
 // cleanup database before test
 func (sql *sql) cleanup() error {
 	tx := sql.db.MustBegin()
-	_, err := sql.db.Exec("TRUNCATE TABLE prefixes")
-	if err != nil {
+	if _, err := sql.db.Exec("TRUNCATE TABLE prefixes"); err != nil {
+		return err
+	}
+	if _, err := sql.db.Exec("UPDATE namespaces SET prefix_count = 0 WHERE name = $1", defaultNamespace); err != nil {
 		return err
 	}
 	return tx.Commit()
