@@ -123,6 +123,73 @@ func TestIpamService(t *testing.T) {
 		}
 	})
 
+	t.Run("AcquireIPWithRequestID", func(t *testing.T) {
+		counter := 0
+		for _, client := range clients {
+			cidr := fmt.Sprintf("192.164.%d.0/24", counter)
+			result, err := client.CreatePrefix(t.Context(), &v1.CreatePrefixRequest{
+				Cidr: cidr,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, cidr, result.GetPrefix().GetCidr())
+
+			requestID := fmt.Sprintf("client-request-%d", counter)
+			acquireresult, err := client.AcquireIP(t.Context(), &v1.AcquireIPRequest{
+				PrefixCidr: cidr,
+				RequestId:  &requestID,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, fmt.Sprintf("192.164.%d.1", counter), acquireresult.GetIp().GetIp())
+			assert.Equal(t, requestID, acquireresult.GetRequestId())
+
+			// replay after a lost response returns the same allocation
+			replayresult, err := client.AcquireIP(t.Context(), &v1.AcquireIPRequest{
+				PrefixCidr: cidr,
+				RequestId:  &requestID,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, acquireresult.GetIp().GetIp(), replayresult.GetIp().GetIp())
+			assert.Equal(t, requestID, replayresult.GetRequestId())
+
+			// same request id with a specific address is a parameter conflict
+			specificIP := fmt.Sprintf("192.164.%d.5", counter)
+			_, err = client.AcquireIP(t.Context(), &v1.AcquireIPRequest{
+				PrefixCidr: cidr,
+				Ip:         &specificIP,
+				RequestId:  &requestID,
+			})
+			require.Error(t, err)
+			assert.Equal(t, connect.CodeAlreadyExists, connect.CodeOf(err))
+
+			// request without a request id keeps the allocate-per-call semantics
+			plainresult, err := client.AcquireIP(t.Context(), &v1.AcquireIPRequest{
+				PrefixCidr: cidr,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, fmt.Sprintf("192.164.%d.2", counter), plainresult.GetIp().GetIp())
+			assert.Empty(t, plainresult.GetRequestId())
+
+			// specific idempotent acquisition replays the same address
+			specificRequestID := fmt.Sprintf("specific-client-request-%d", counter)
+			specificAcquire := func() error {
+				r, err := client.AcquireIP(t.Context(), &v1.AcquireIPRequest{
+					PrefixCidr: cidr,
+					Ip:         &specificIP,
+					RequestId:  &specificRequestID,
+				})
+				if err == nil {
+					assert.Equal(t, specificIP, r.GetIp().GetIp())
+					assert.Equal(t, specificRequestID, r.GetRequestId())
+				}
+				return err
+			}
+			require.NoError(t, specificAcquire())
+			require.NoError(t, specificAcquire())
+
+			counter++
+		}
+	})
+
 	t.Run("CreateDeleteGetPrefixNamespaced", func(t *testing.T) {
 		counter := 0
 		for _, client := range clients {

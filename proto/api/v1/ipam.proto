@@ -98,6 +98,9 @@ message IP {
 message AcquireIPResponse {
   IP ip = 1;
   optional string namespace = 2;
+  // request_id is the echoed client request identifier of an idempotent acquisition,
+  // empty when the request did not carry one.
+  optional string request_id = 3;
 }
 message ReleaseIPResponse {
   IP ip = 1;
@@ -106,6 +109,10 @@ message AcquireIPRequest {
   string prefix_cidr = 1;
   optional string ip = 2;
   optional string namespace = 3;
+  // request_id is an optional client generated identifier that makes the acquisition
+  // idempotent: replays with the same identifier return the same allocated address.
+  // Reusing it with a different prefix, specific address or operation kind is rejected.
+  optional string request_id = 4;
 }
 message ReleaseIPRequest {
   string prefix_cidr = 1;

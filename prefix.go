@@ -24,7 +24,24 @@ type Prefix struct {
 	// TODO remove this in the next release
 	childPrefixLength int             // the length of the child prefixes
 	ips               map[string]bool // The ips contained in this prefix
-	version           int64           // version is used for optimistic locking
+	// ipRequests holds the persisted idempotency records of client identified IP
+	// acquisitions, keyed by the client request id. The records are persisted
+	// together with the prefix allocation in the same optimistic-locked write.
+	ipRequests map[string]ipRequest
+	version    int64 // version is used for optimistic locking
+}
+
+// operation kinds of idempotent IP acquisition requests
+const (
+	ipRequestKindAcquire         = "AcquireIP"
+	ipRequestKindAcquireSpecific = "AcquireSpecificIP"
+)
+
+// ipRequest is the persisted idempotency record of a client identified IP acquisition.
+type ipRequest struct {
+	Kind       string `json:"Kind"`       // ipRequestKindAcquire or ipRequestKindAcquireSpecific
+	SpecificIP string `json:"SpecificIP"` // requested specific address, empty for dynamic acquisition
+	IP         string `json:"IP"`         // persistently allocated address
 }
 
 type Prefixes []Prefix
@@ -38,6 +55,7 @@ func (p *Prefix) deepCopy() *Prefix {
 		childPrefixLength:      p.childPrefixLength,
 		availableChildPrefixes: copyMap(p.availableChildPrefixes),
 		ips:                    copyMap(p.ips),
+		ipRequests:             copyIPRequestMap(p.ipRequests),
 		version:                p.version,
 	}
 }
@@ -56,6 +74,9 @@ func (p *Prefix) GobEncode() ([]byte, error) {
 		return nil, err
 	}
 	if err := encoder.Encode(p.ips); err != nil {
+		return nil, err
+	}
+	if err := encoder.Encode(p.ipRequests); err != nil {
 		return nil, err
 	}
 	if err := encoder.Encode(p.version); err != nil {
@@ -86,6 +107,9 @@ func (p *Prefix) GobDecode(buf []byte) error {
 	if err := decoder.Decode(&p.ips); err != nil {
 		return err
 	}
+	if err := decoder.Decode(&p.ipRequests); err != nil {
+		return err
+	}
 	if err := decoder.Decode(&p.version); err != nil {
 		return err
 	}
@@ -97,6 +121,12 @@ func (p *Prefix) GobDecode(buf []byte) error {
 
 func copyMap(m map[string]bool) map[string]bool {
 	cm := make(map[string]bool, len(m))
+	maps.Copy(cm, m)
+	return cm
+}
+
+func copyIPRequestMap(m map[string]ipRequest) map[string]ipRequest {
+	cm := make(map[string]ipRequest, len(m))
 	maps.Copy(cm, m)
 	return cm
 }
@@ -336,11 +366,46 @@ func (i *ipamer) PrefixFrom(ctx context.Context, cidr string) (*Prefix, error) {
 }
 
 func (i *ipamer) AcquireSpecificIP(ctx context.Context, prefixCidr, specificIP string) (*IP, error) {
+	return i.acquireIP(ctx, prefixCidr, specificIP, "")
+}
+
+func (i *ipamer) AcquireIP(ctx context.Context, prefixCidr string) (*IP, error) {
+	return i.acquireIP(ctx, prefixCidr, "", "")
+}
+
+func (i *ipamer) AcquireSpecificIPWithRequestID(ctx context.Context, prefixCidr, specificIP, requestID string) (*IP, error) {
+	if requestID == "" {
+		return nil, fmt.Errorf("request id must not be empty for idempotent acquisition")
+	}
+	if specificIP == "" {
+		return nil, fmt.Errorf("specific ip must not be empty, use AcquireIPWithRequestID for dynamic acquisition")
+	}
+	return i.acquireIP(ctx, prefixCidr, specificIP, requestID)
+}
+
+func (i *ipamer) AcquireIPWithRequestID(ctx context.Context, prefixCidr, requestID string) (*IP, error) {
+	if requestID == "" {
+		return nil, fmt.Errorf("request id must not be empty for idempotent acquisition")
+	}
+	return i.acquireIP(ctx, prefixCidr, "", requestID)
+}
+
+// acquireIP acquires an ip, optionally idempotently identified by a client request id.
+// Idempotent acquisitions are serialized process wide via i.mu so that concurrent replays
+// (including replays targeting different prefixes) collapse onto one stored decision.
+func (i *ipamer) acquireIP(ctx context.Context, prefixCidr, specificIP, requestID string) (ip *IP, err error) {
 	namespace := namespaceFromContext(ctx)
-	var ip *IP
-	err := retryOnOptimisticLock(func() error {
+	kind := ipRequestKindAcquire
+	if specificIP != "" {
+		kind = ipRequestKindAcquireSpecific
+	}
+	if requestID != "" {
+		i.mu.Lock()
+		defer i.mu.Unlock()
+	}
+	err = retryOnOptimisticLock(func() error {
 		var err error
-		ip, err = i.acquireSpecificIPInternal(ctx, namespace, prefixCidr, specificIP)
+		ip, err = i.acquireSpecificIPInternal(ctx, namespace, prefixCidr, specificIP, requestID, kind)
 		return err
 	})
 	return ip, err
@@ -350,7 +415,9 @@ func (i *ipamer) AcquireSpecificIP(ctx context.Context, prefixCidr, specificIP s
 // If specificIP is empty, the next free IP is returned.
 // If there is no free IP an NoIPAvailableError is returned.
 // If the Prefix is not found an NotFoundError is returned.
-func (i *ipamer) acquireSpecificIPInternal(ctx context.Context, namespace, prefixCidr, specificIP string) (*IP, error) {
+// When requestID is not empty the allocation and its idempotency record are persisted in the
+// same optimistic locked prefix update, and replays return the originally allocated address.
+func (i *ipamer) acquireSpecificIPInternal(ctx context.Context, namespace, prefixCidr, specificIP, requestID, kind string) (*IP, error) {
 	prefix, err := i.PrefixFrom(ctx, prefixCidr)
 	if err != nil {
 		return nil, fmt.Errorf("%w: unable to find prefix for cidr:%s error:%s", ErrNotFound, prefixCidr, err.Error())
@@ -375,41 +442,120 @@ func (i *ipamer) acquireSpecificIPInternal(ctx context.Context, namespace, prefi
 		if !ipnet.Contains(specificIPnet) {
 			return nil, fmt.Errorf("given ip:%s is not in %s", specificIP, prefixCidr)
 		}
-		_, ok := prefix.ips[specificIPnet.String()]
-		if ok {
-			return nil, fmt.Errorf("%w: given ip:%s is already allocated", ErrAlreadyAllocated, specificIPnet)
-		}
-		return i.acquireAndStore(ctx, namespace, prefix, specificIPnet)
+		specificIP = specificIPnet.String()
 	}
 
-	iprange := netipx.RangeOfPrefix(ipnet)
-	for ip := iprange.From(); ipnet.Contains(ip); ip = ip.Next() {
-		ipstring := ip.String()
-		_, ok := prefix.ips[ipstring]
-		if ok {
-			continue
+	if requestID != "" {
+		record, ok := prefix.ipRequests[requestID]
+		recordPrefixCidr := prefix.Cidr
+		if !ok {
+			// Another server process may have committed the record after this prefix
+			// was read, so scan the namespace before deciding to allocate.
+			ownerCidr, stored, err := i.lookupIPRequestRecord(ctx, namespace, requestID)
+			if err != nil {
+				return nil, err
+			}
+			if ownerCidr != "" {
+				ok = true
+				record = stored
+				recordPrefixCidr = ownerCidr
+			}
 		}
-		return i.acquireAndStore(ctx, namespace, prefix, ip)
+		if ok {
+			if recordPrefixCidr != prefix.Cidr || record.Kind != kind || record.SpecificIP != specificIP {
+				return nil, requestIDConflictError(requestID, recordPrefixCidr, record, prefix.Cidr, kind, specificIP)
+			}
+			return replayIPRequest(prefix.Cidr, requestID, record)
+		}
 	}
 
-	return nil, fmt.Errorf("%w: no more ips in prefix: %s left, length of prefix.ips: %d", ErrNoIPAvailable, prefix.Cidr, len(prefix.ips))
+	var acquiredIP netip.Addr
+	if specificIP != "" {
+		if _, ok := prefix.ips[specificIP]; ok {
+			return nil, fmt.Errorf("%w: given ip:%s is already allocated", ErrAlreadyAllocated, specificIP)
+		}
+		acquiredIP = specificIPnet
+	} else {
+		found := false
+		iprange := netipx.RangeOfPrefix(ipnet)
+		for ip := iprange.From(); ipnet.Contains(ip); ip = ip.Next() {
+			ipstring := ip.String()
+			if _, ok := prefix.ips[ipstring]; ok {
+				continue
+			}
+			acquiredIP = ip
+			found = true
+			break
+		}
+		if !found {
+			return nil, fmt.Errorf("%w: no more ips in prefix: %s left, length of prefix.ips: %d", ErrNoIPAvailable, prefix.Cidr, len(prefix.ips))
+		}
+	}
+
+	return i.acquireAndStore(ctx, namespace, prefix, acquiredIP, requestID, kind, specificIP)
 }
 
-func (i *ipamer) acquireAndStore(ctx context.Context, namespace string, prefix *Prefix, ip netip.Addr) (*IP, error) {
+// replayIPRequest returns the persistently allocated address of a previous idempotent
+// request. The caller has already verified that record matches the request parameters.
+func replayIPRequest(prefixCidr, requestID string, record ipRequest) (*IP, error) {
+	replayedIP, err := netip.ParseAddr(record.IP)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse stored ip:%s of request id:%s: %w", record.IP, requestID, err)
+	}
+	return &IP{
+		IP:           replayedIP,
+		ParentPrefix: prefixCidr,
+	}, nil
+}
+
+// requestIDConflictError builds the conflict error describing the stored binding and the
+// diverging reuse attempt.
+func requestIDConflictError(requestID, storedPrefixCidr string, record ipRequest, requestedPrefixCidr, kind, specificIP string) error {
+	return fmt.Errorf("%w: request id:%s was already used for %s on prefix:%s with specific ip:%q, cannot reuse it for %s on prefix:%s with specific ip:%q",
+		ErrRequestIDConflict, requestID, record.Kind, storedPrefixCidr, record.SpecificIP, kind, requestedPrefixCidr, specificIP)
+}
+
+// lookupIPRequestRecord scans all prefixes of the namespace for a client request id and
+// returns the cidr of the prefix owning the record and the record itself.
+// An empty owner cidr means no record exists. Idempotent calls hold i.mu, so within this
+// process the scan is stable, it additionally covers records committed by another server
+// process after the target prefix was read.
+func (i *ipamer) lookupIPRequestRecord(ctx context.Context, namespace, requestID string) (string, ipRequest, error) {
+	prefixes, err := i.storage.ReadAllPrefixes(ctx, namespace)
+	if err != nil {
+		return "", ipRequest{}, fmt.Errorf("unable to scan existing request ids: %w", err)
+	}
+	for _, p := range prefixes {
+		if record, ok := p.ipRequests[requestID]; ok {
+			return p.Cidr, record, nil
+		}
+	}
+	return "", ipRequest{}, nil
+}
+
+func (i *ipamer) acquireAndStore(ctx context.Context, namespace string, prefix *Prefix, ip netip.Addr, requestID, kind, specificIP string) (*IP, error) {
 	acquired := &IP{
 		IP:           ip,
 		ParentPrefix: prefix.Cidr,
 	}
 	prefix.ips[ip.String()] = true
+	if requestID != "" {
+		if prefix.ipRequests == nil {
+			prefix.ipRequests = make(map[string]ipRequest)
+		}
+		// The idempotency record is persisted in the same prefix write as the allocated
+		// address, so a failed write never occupies an address without a replayable result.
+		prefix.ipRequests[requestID] = ipRequest{
+			Kind:       kind,
+			SpecificIP: specificIP,
+			IP:         ip.String(),
+		}
+	}
 	_, err := i.storage.UpdatePrefix(ctx, *prefix, namespace)
 	if err != nil {
 		return nil, fmt.Errorf("unable to persist acquired ip:%v error:%w", prefix, err)
 	}
 	return acquired, nil
-}
-
-func (i *ipamer) AcquireIP(ctx context.Context, prefixCidr string) (*IP, error) {
-	return i.AcquireSpecificIP(ctx, prefixCidr, "")
 }
 
 func (i *ipamer) ReleaseIP(ctx context.Context, ip *IP) (*Prefix, error) {
@@ -441,6 +587,13 @@ func (i *ipamer) releaseIPFromPrefixInternal(ctx context.Context, namespace, pre
 		return fmt.Errorf("%w: unable to release ip:%s because it is not allocated in prefix:%s", ErrNotFound, ip, prefixCidr)
 	}
 	delete(prefix.ips, ip)
+	// Finalize the idempotency record of the released address, if any, so that a later
+	// request reusing the request id cannot return the stale allocation.
+	for requestID, record := range prefix.ipRequests {
+		if record.IP == ip {
+			delete(prefix.ipRequests, requestID)
+		}
+	}
 	_, err = i.storage.UpdatePrefix(ctx, *prefix, namespace)
 	if err != nil {
 		return fmt.Errorf("unable to release ip %v:%w", ip, err)
@@ -488,6 +641,7 @@ func (i *ipamer) newPrefix(cidr, parentCidr string) (*Prefix, error) {
 		ParentCidr:             parentCidr,
 		ips:                    make(map[string]bool),
 		availableChildPrefixes: make(map[string]bool),
+		ipRequests:             make(map[string]ipRequest),
 		isParent:               false,
 	}
 

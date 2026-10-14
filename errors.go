@@ -15,4 +15,7 @@ var (
 	ErrNamespaceDoesNotExist = errors.New("NamespaceDoesNotExist")
 	// ErrNameTooLong is returned when a name exceeds the databases max identifier length
 	ErrNameTooLong = errors.New("NameTooLong")
+	// ErrRequestIDConflict is returned when a client request id is reused with different
+	// operation parameters (different prefix, specific address or operation kind)
+	ErrRequestIDConflict = errors.New("RequestIDConflictError")
 )

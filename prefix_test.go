@@ -1361,6 +1361,7 @@ func TestPrefixDeepCopy(t *testing.T) {
 		availableChildPrefixes: map[string]bool{},
 		isParent:               true,
 		ips:                    map[string]bool{},
+		ipRequests:             map[string]ipRequest{},
 		version:                2,
 	}
 

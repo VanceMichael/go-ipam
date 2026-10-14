@@ -10,10 +10,11 @@ type prefixJSON struct {
 	Namespace              string          `json:"Namespace"`
 	AvailableChildPrefixes map[string]bool `json:"AvailableChildPrefixes"` // available child prefixes of this prefix
 	// TODO remove this in the next release
-	ChildPrefixLength int             `json:"ChildPrefixLength"` // the length of the child prefixes. Legacy to migrate existing prefixes stored in the db to set the IsParent on reads.
-	IsParent          bool            `json:"IsParent"`          // set to true if there are child prefixes
-	IPs               map[string]bool `json:"IPs"`               // The ips contained in this prefix
-	Version           int64           `json:"Version"`           // Version is used for optimistic locking
+	ChildPrefixLength int                  `json:"ChildPrefixLength"`    // the length of the child prefixes. Legacy to migrate existing prefixes stored in the db to set the IsParent on reads.
+	IsParent          bool                 `json:"IsParent"`             // set to true if there are child prefixes
+	IPs               map[string]bool      `json:"IPs"`                  // The ips contained in this prefix
+	IPRequests        map[string]ipRequest `json:"IPRequests,omitempty"` // Idempotency records of client identified IP acquisitions, keyed by request id
+	Version           int64                `json:"Version"`              // Version is used for optimistic locking
 }
 
 func (p prefixJSON) toPrefix() Prefix {
@@ -22,6 +23,12 @@ func (p prefixJSON) toPrefix() Prefix {
 	if p.ChildPrefixLength > 0 {
 		p.IsParent = true
 	}
+	// records written before ipRequests existed deserialize to nil, normalize to an
+	// empty map so that loaded prefixes equal freshly created ones
+	ipRequests := p.IPRequests
+	if ipRequests == nil {
+		ipRequests = map[string]ipRequest{}
+	}
 	return Prefix{
 		Cidr:                   p.Cidr,
 		ParentCidr:             p.ParentCidr,
@@ -29,6 +36,7 @@ func (p prefixJSON) toPrefix() Prefix {
 		childPrefixLength:      p.ChildPrefixLength,
 		isParent:               p.IsParent,
 		ips:                    p.IPs,
+		ipRequests:             ipRequests,
 		version:                p.Version,
 	}
 }
@@ -42,6 +50,7 @@ func (p *Prefix) toPrefixJSON() prefixJSON {
 		// TODO remove this in the next release
 		ChildPrefixLength: p.childPrefixLength,
 		IPs:               p.ips,
+		IPRequests:        p.ipRequests,
 		Version:           p.version,
 	}
 }

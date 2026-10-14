@@ -41,6 +41,23 @@ type Ipamer interface {
 	// AcquireIP will return the next unused IP from this Prefix.
 	// This operation is scoped to the root namespace unless a different namespace is provided in the context.
 	AcquireIP(ctx context.Context, prefixCidr string) (*IP, error)
+	// AcquireSpecificIPWithRequestID behaves like AcquireSpecificIP, but takes a client generated
+	// request id which makes the operation idempotent: replays in the same namespace and prefix with
+	// the same request id return the originally allocated IP, even across concurrent calls, retries
+	// after a lost response and service restarts.
+	// Reusing the same request id with a different prefix, a different specific address or a different
+	// operation kind returns an RequestIDConflictError.
+	// specificIP must not be empty, use AcquireIPWithRequestID for dynamic address acquisition.
+	// This operation is scoped to the root namespace unless a different namespace is provided in the context.
+	AcquireSpecificIPWithRequestID(ctx context.Context, prefixCidr, specificIP, requestID string) (*IP, error)
+	// AcquireIPWithRequestID behaves like AcquireIP, but takes a client generated request id which
+	// makes the operation idempotent: replays in the same namespace and prefix with the same request
+	// id return the originally allocated IP, even across concurrent calls, retries after a lost
+	// response and service restarts.
+	// Reusing the same request id with a different prefix, a specific address or a different
+	// operation kind returns an RequestIDConflictError.
+	// This operation is scoped to the root namespace unless a different namespace is provided in the context.
+	AcquireIPWithRequestID(ctx context.Context, prefixCidr, requestID string) (*IP, error)
 	// ReleaseIP will release the given IP for later usage and returns the updated Prefix.
 	// If the IP is not found an NotFoundError is returned.
 	// This operation is scoped to the root namespace unless a different namespace is provided in the context.

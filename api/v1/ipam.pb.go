@@ -845,9 +845,12 @@ func (x *IP) GetParentPrefix() string {
 }
 
 type AcquireIPResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ip            *IP                    `protobuf:"bytes,1,opt,name=ip,proto3" json:"ip,omitempty"`
-	Namespace     *string                `protobuf:"bytes,2,opt,name=namespace,proto3,oneof" json:"namespace,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Ip        *IP                    `protobuf:"bytes,1,opt,name=ip,proto3" json:"ip,omitempty"`
+	Namespace *string                `protobuf:"bytes,2,opt,name=namespace,proto3,oneof" json:"namespace,omitempty"`
+	// request_id is the echoed client request identifier of an idempotent acquisition,
+	// empty when the request did not carry one.
+	RequestId     *string `protobuf:"bytes,3,opt,name=request_id,json=requestId,proto3,oneof" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -892,6 +895,13 @@ func (x *AcquireIPResponse) GetIp() *IP {
 func (x *AcquireIPResponse) GetNamespace() string {
 	if x != nil && x.Namespace != nil {
 		return *x.Namespace
+	}
+	return ""
+}
+
+func (x *AcquireIPResponse) GetRequestId() string {
+	if x != nil && x.RequestId != nil {
+		return *x.RequestId
 	}
 	return ""
 }
@@ -941,10 +951,14 @@ func (x *ReleaseIPResponse) GetIp() *IP {
 }
 
 type AcquireIPRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	PrefixCidr    string                 `protobuf:"bytes,1,opt,name=prefix_cidr,json=prefixCidr,proto3" json:"prefix_cidr,omitempty"`
-	Ip            *string                `protobuf:"bytes,2,opt,name=ip,proto3,oneof" json:"ip,omitempty"`
-	Namespace     *string                `protobuf:"bytes,3,opt,name=namespace,proto3,oneof" json:"namespace,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	PrefixCidr string                 `protobuf:"bytes,1,opt,name=prefix_cidr,json=prefixCidr,proto3" json:"prefix_cidr,omitempty"`
+	Ip         *string                `protobuf:"bytes,2,opt,name=ip,proto3,oneof" json:"ip,omitempty"`
+	Namespace  *string                `protobuf:"bytes,3,opt,name=namespace,proto3,oneof" json:"namespace,omitempty"`
+	// request_id is an optional client generated identifier that makes the acquisition
+	// idempotent: replays with the same identifier return the same allocated address.
+	// Reusing it with a different prefix, specific address or operation kind is rejected.
+	RequestId     *string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3,oneof" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -996,6 +1010,13 @@ func (x *AcquireIPRequest) GetIp() string {
 func (x *AcquireIPRequest) GetNamespace() string {
 	if x != nil && x.Namespace != nil {
 		return *x.Namespace
+	}
+	return ""
+}
+
+func (x *AcquireIPRequest) GetRequestId() string {
+	if x != nil && x.RequestId != nil {
+		return *x.RequestId
 	}
 	return ""
 }
@@ -1647,24 +1668,30 @@ const file_api_v1_ipam_proto_rawDesc = "" +
 	"_namespace\"9\n" +
 	"\x02IP\x12\x0e\n" +
 	"\x02ip\x18\x01 \x01(\tR\x02ip\x12#\n" +
-	"\rparent_prefix\x18\x02 \x01(\tR\fparentPrefix\"`\n" +
+	"\rparent_prefix\x18\x02 \x01(\tR\fparentPrefix\"\x93\x01\n" +
 	"\x11AcquireIPResponse\x12\x1a\n" +
 	"\x02ip\x18\x01 \x01(\v2\n" +
 	".api.v1.IPR\x02ip\x12!\n" +
-	"\tnamespace\x18\x02 \x01(\tH\x00R\tnamespace\x88\x01\x01B\f\n" +
+	"\tnamespace\x18\x02 \x01(\tH\x00R\tnamespace\x88\x01\x01\x12\"\n" +
 	"\n" +
-	"_namespace\"/\n" +
+	"request_id\x18\x03 \x01(\tH\x01R\trequestId\x88\x01\x01B\f\n" +
+	"\n" +
+	"_namespaceB\r\n" +
+	"\v_request_id\"/\n" +
 	"\x11ReleaseIPResponse\x12\x1a\n" +
 	"\x02ip\x18\x01 \x01(\v2\n" +
-	".api.v1.IPR\x02ip\"\x80\x01\n" +
+	".api.v1.IPR\x02ip\"\xb3\x01\n" +
 	"\x10AcquireIPRequest\x12\x1f\n" +
 	"\vprefix_cidr\x18\x01 \x01(\tR\n" +
 	"prefixCidr\x12\x13\n" +
 	"\x02ip\x18\x02 \x01(\tH\x00R\x02ip\x88\x01\x01\x12!\n" +
-	"\tnamespace\x18\x03 \x01(\tH\x01R\tnamespace\x88\x01\x01B\x05\n" +
+	"\tnamespace\x18\x03 \x01(\tH\x01R\tnamespace\x88\x01\x01\x12\"\n" +
+	"\n" +
+	"request_id\x18\x04 \x01(\tH\x02R\trequestId\x88\x01\x01B\x05\n" +
 	"\x03_ipB\f\n" +
 	"\n" +
-	"_namespace\"t\n" +
+	"_namespaceB\r\n" +
+	"\v_request_id\"t\n" +
 	"\x10ReleaseIPRequest\x12\x1f\n" +
 	"\vprefix_cidr\x18\x01 \x01(\tR\n" +
 	"prefixCidr\x12\x0e\n" +

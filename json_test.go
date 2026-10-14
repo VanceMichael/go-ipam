@@ -15,6 +15,7 @@ func TestPrefixes_JSON(t *testing.T) {
 		availableChildPrefixes: map[string]bool{},
 		childPrefixLength:      0,
 		ips:                    map[string]bool{"192.168.0.1": true, "192.168.0.2": true},
+		ipRequests:             map[string]ipRequest{},
 		version:                0,
 	}
 
@@ -25,6 +26,7 @@ func TestPrefixes_JSON(t *testing.T) {
 		availableChildPrefixes: map[string]bool{},
 		childPrefixLength:      0,
 		ips:                    map[string]bool{"172.17.0.1": true, "172.17.0.2": true},
+		ipRequests:             map[string]ipRequest{},
 		version:                0,
 	}
 

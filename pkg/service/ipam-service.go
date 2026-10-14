@@ -176,28 +176,46 @@ func (i *IPAMService) AcquireIP(ctx context.Context, req *v1.AcquireIPRequest) (
 	var resp *goipam.IP
 	var err error
 	if req.GetIp() != "" {
-		resp, err = i.ipamer.AcquireSpecificIP(ctx, req.GetPrefixCidr(), req.GetIp())
+		if req.GetRequestId() != "" {
+			resp, err = i.ipamer.AcquireSpecificIPWithRequestID(ctx, req.GetPrefixCidr(), req.GetIp(), req.GetRequestId())
+		} else {
+			resp, err = i.ipamer.AcquireSpecificIP(ctx, req.GetPrefixCidr(), req.GetIp())
+		}
 		if err != nil {
-			if errors.Is(err, goipam.ErrAlreadyAllocated) {
+			switch {
+			case errors.Is(err, goipam.ErrAlreadyAllocated), errors.Is(err, goipam.ErrRequestIDConflict):
 				return nil, connect.NewError(connect.CodeAlreadyExists, err)
+			default:
+				return nil, connect.NewError(connect.CodeInvalidArgument, err)
 			}
-			return nil, connect.NewError(connect.CodeInvalidArgument, err)
 		}
 	} else {
-		resp, err = i.ipamer.AcquireIP(ctx, req.GetPrefixCidr())
+		if req.GetRequestId() != "" {
+			resp, err = i.ipamer.AcquireIPWithRequestID(ctx, req.GetPrefixCidr(), req.GetRequestId())
+		} else {
+			resp, err = i.ipamer.AcquireIP(ctx, req.GetPrefixCidr())
+		}
 		if err != nil {
-			if errors.Is(err, goipam.ErrNoIPAvailable) {
+			switch {
+			case errors.Is(err, goipam.ErrNoIPAvailable):
 				return nil, connect.NewError(connect.CodeNotFound, err)
+			case errors.Is(err, goipam.ErrRequestIDConflict):
+				return nil, connect.NewError(connect.CodeAlreadyExists, err)
+			default:
+				return nil, connect.NewError(connect.CodeInvalidArgument, err)
 			}
-			return nil, connect.NewError(connect.CodeInvalidArgument, err)
 		}
 	}
-	return &v1.AcquireIPResponse{
+	response := &v1.AcquireIPResponse{
 		Ip: &v1.IP{
 			Ip:           resp.IP.String(),
 			ParentPrefix: resp.ParentPrefix,
 		},
-	}, nil
+	}
+	if req.RequestId != nil {
+		response.RequestId = req.RequestId
+	}
+	return response, nil
 }
 func (i *IPAMService) ReleaseIP(ctx context.Context, req *v1.ReleaseIPRequest) (*v1.ReleaseIPResponse, error) {
 	if req.GetNamespace() != "" {

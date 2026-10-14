@@ -154,17 +154,36 @@ func main() {
 							&cli.StringFlag{
 								Name: "prefix",
 							},
+							&cli.StringFlag{
+								Name:  "ip",
+								Usage: "acquire this specific ip instead of the next free one",
+							},
+							&cli.StringFlag{
+								Name:  "request-id",
+								Usage: "client generated id making the acquisition idempotent, replays return the same ip",
+							},
 						},
 						Action: func(ctx *cli.Context) error {
 							c := client(ctx)
-							result, err := c.AcquireIP(ctx.Context, &v1.AcquireIPRequest{
+							req := &v1.AcquireIPRequest{
 								PrefixCidr: ctx.String("prefix"),
-							})
+							}
+							if specificIP := ctx.String("ip"); specificIP != "" {
+								req.Ip = &specificIP
+							}
+							if requestID := ctx.String("request-id"); requestID != "" {
+								req.RequestId = &requestID
+							}
+							result, err := c.AcquireIP(ctx.Context, req)
 
 							if err != nil {
 								return err
 							}
-							fmt.Printf("ip:%q acquired\n", result.GetIp().GetIp())
+							if result.GetRequestId() != "" {
+								fmt.Printf("ip:%q acquired (request-id:%q)\n", result.GetIp().GetIp(), result.GetRequestId())
+							} else {
+								fmt.Printf("ip:%q acquired\n", result.GetIp().GetIp())
+							}
 							return nil
 						},
 					},
