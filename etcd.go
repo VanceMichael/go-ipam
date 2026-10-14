@@ -256,7 +256,7 @@ func (e *etcd) UpdatePrefix(ctx context.Context, prefix Prefix, namespace string
 	}
 
 	if p.Count == 0 {
-		return Prefix{}, fmt.Errorf("unable to get all prefix cidrs:%w", err)
+		return Prefix{}, fmt.Errorf("%w: unable to update prefix:%s, prefix does not exist", ErrNotFound, prefix.Cidr)
 	}
 
 	oldPrefix, err := fromJSON([]byte(p.Kvs[0].Value))
@@ -290,9 +290,40 @@ func (e *etcd) DeletePrefix(ctx context.Context, prefix Prefix, namespace string
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	key := namespace + "@" + prefix.Cidr
-	_, err := e.etcdDB.Delete(ctx, key)
+	get, err := e.etcdDB.Get(ctx, key)
 	if err != nil {
-		return *prefix.deepCopy(), err
+		return Prefix{}, fmt.Errorf("unable to read prefix:%s from ETCD: %w", prefix.Cidr, err)
+	}
+	if get.Count == 0 {
+		return Prefix{}, fmt.Errorf("%w: unable to delete prefix:%s", ErrNotFound, prefix.Cidr)
+	}
+
+	// Version arbitration: the stored prefix must still be at the version the
+	// caller observed to be empty.
+	current, err := fromJSON(get.Kvs[0].Value)
+	if err != nil {
+		return Prefix{}, err
+	}
+	if current.version != prefix.version {
+		return Prefix{}, fmt.Errorf("%w: unable to delete prefix:%s", ErrOptimisticLockError, prefix.Cidr)
+	}
+
+	// Atomically delete only while the key still has the read modification
+	// revision, closing the gap between the get above and the transaction. A
+	// concurrent AcquireIP/UpdatePrefix bumps the revision (also on
+	// delete+recreate), so a racing allocation either makes this transaction fail
+	// with ErrOptimisticLockError or is itself refused because the key is gone.
+	ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	resp, err := e.etcdDB.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(key), "=", get.Kvs[0].ModRevision)).
+		Then(clientv3.OpDelete(key)).
+		Commit()
+	if err != nil {
+		return Prefix{}, fmt.Errorf("unable to delete prefix:%s from ETCD: %w", prefix.Cidr, err)
+	}
+	if !resp.Succeeded {
+		return Prefix{}, fmt.Errorf("%w: unable to delete prefix:%s", ErrOptimisticLockError, prefix.Cidr)
 	}
 	return *prefix.deepCopy(), nil
 }

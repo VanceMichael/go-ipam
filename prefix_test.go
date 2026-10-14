@@ -1152,7 +1152,8 @@ func TestIpamer_DeletePrefix(t *testing.T) {
 
 		_, err = ipam.DeletePrefix(ctx, prefix.Cidr)
 		require.Error(t, err)
-		require.Equal(t, "prefix 192.168.0.0/20 has ips, delete prefix not possible", err.Error())
+		require.ErrorIs(t, err, ErrPrefixHasIPs)
+		require.Equal(t, "PrefixHasIPsError: prefix 192.168.0.0/20 has ips, delete prefix not possible", err.Error())
 
 		// IPv6
 		prefix, err = ipam.NewPrefix(ctx, "2001:0db8:85a3::/120")
@@ -1168,7 +1169,8 @@ func TestIpamer_DeletePrefix(t *testing.T) {
 
 		_, err = ipam.DeletePrefix(ctx, prefix.Cidr)
 		require.Error(t, err)
-		require.Equal(t, "prefix 2001:db8:85a3::/120 has ips, delete prefix not possible", err.Error())
+		require.ErrorIs(t, err, ErrPrefixHasIPs)
+		require.Equal(t, "PrefixHasIPsError: prefix 2001:db8:85a3::/120 has ips, delete prefix not possible", err.Error())
 
 		_, err = ipam.ReleaseIP(ctx, ip)
 		require.NoError(t, err)

@@ -42,8 +42,9 @@ func Test_UpdatePrefix(t *testing.T) {
 	prefix.Cidr = "1.2.3.4/24"
 	p, err = m.UpdatePrefix(ctx, prefix, defaultNamespace)
 	require.Error(t, err)
+	require.ErrorIs(t, err, ErrNotFound)
 	require.Empty(t, p)
-	require.Equal(t, "prefix not found:1.2.3.4/24", err.Error())
+	require.Equal(t, "NotFound: prefix not found:1.2.3.4/24", err.Error())
 }
 
 // ensure that locks on memory storage work

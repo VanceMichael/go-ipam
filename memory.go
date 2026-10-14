@@ -101,7 +101,7 @@ func (m *memory) UpdatePrefix(_ context.Context, prefix Prefix, namespace string
 	}
 	oldPrefix, ok := m.prefixes[namespace][prefix.Cidr]
 	if !ok {
-		return Prefix{}, fmt.Errorf("prefix not found:%s", prefix.Cidr)
+		return Prefix{}, fmt.Errorf("%w: prefix not found:%s", ErrNotFound, prefix.Cidr)
 	}
 
 	if oldPrefix.version != oldVersion {
@@ -110,13 +110,26 @@ func (m *memory) UpdatePrefix(_ context.Context, prefix Prefix, namespace string
 	m.prefixes[namespace][prefix.Cidr] = *prefix.deepCopy()
 	return prefix, nil
 }
+
+// DeletePrefix conditionally deletes the prefix only if the stored prefix is
+// still at the given version. It returns ErrNotFound if the prefix does not
+// exist and ErrOptimisticLockError if the stored version differs from the
+// expected one (a concurrent AcquireIP/UpdatePrefix committed in between).
 func (m *memory) DeletePrefix(_ context.Context, prefix Prefix, namespace string) (Prefix, error) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	if _, ok := m.prefixes[namespace]; !ok {
+	ns, ok := m.prefixes[namespace]
+	if !ok {
 		return Prefix{}, ErrNamespaceDoesNotExist
 	}
-	delete(m.prefixes[namespace], prefix.Cidr)
+	current, ok := ns[prefix.Cidr]
+	if !ok {
+		return Prefix{}, fmt.Errorf("%w: unable to delete prefix:%s", ErrNotFound, prefix.Cidr)
+	}
+	if current.version != prefix.version {
+		return Prefix{}, fmt.Errorf("%w: unable to delete prefix:%s", ErrOptimisticLockError, prefix.Cidr)
+	}
+	delete(ns, prefix.Cidr)
 	return *prefix.deepCopy(), nil
 }
 

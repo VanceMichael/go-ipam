@@ -164,7 +164,10 @@ func (r *redis) UpdatePrefix(ctx context.Context, prefix Prefix, namespace strin
 	txf := func(tx *redigo.Tx) error {
 		// Get current value or zero.
 		p, err := tx.HGet(ctx, namespace, prefix.Cidr).Result()
-		if err != nil && !errors.Is(err, redigo.Nil) {
+		if err != nil {
+			if errors.Is(err, redigo.Nil) {
+				return fmt.Errorf("%w: unable to update prefix:%s, prefix does not exist", ErrNotFound, prefix.Cidr)
+			}
 			return err
 		}
 		oldPrefix, err := fromJSON([]byte(p))
@@ -185,6 +188,9 @@ func (r *redis) UpdatePrefix(ctx context.Context, prefix Prefix, namespace strin
 	}
 	err = r.rdb.Watch(ctx, txf, namespace)
 	if err != nil {
+		if errors.Is(err, redigo.TxFailedErr) {
+			return Prefix{}, fmt.Errorf("%w: unable to update prefix:%s", ErrOptimisticLockError, prefix.Cidr)
+		}
 		return Prefix{}, err
 	}
 
@@ -198,8 +204,38 @@ func (r *redis) DeletePrefix(ctx context.Context, prefix Prefix, namespace strin
 		return Prefix{}, err
 	}
 
-	if err := r.rdb.HDel(ctx, namespace, prefix.Cidr).Err(); err != nil {
-		return *prefix.deepCopy(), err
+	// WATCH makes the version check and the HDEL atomic: the transaction is
+	// only executed if the namespace hash was not modified in between. A
+	// concurrent AcquireIP/UpdatePrefix either surfaces as a version mismatch
+	// inside the transaction (ErrOptimisticLockError) or aborts the transaction
+	// (redigo.TxFailedErr, mapped to the same conflict error).
+	txf := func(tx *redigo.Tx) error {
+		p, err := tx.HGet(ctx, namespace, prefix.Cidr).Result()
+		if err != nil {
+			if errors.Is(err, redigo.Nil) {
+				return fmt.Errorf("%w: unable to delete prefix:%s", ErrNotFound, prefix.Cidr)
+			}
+			return err
+		}
+		oldPrefix, err := fromJSON([]byte(p))
+		if err != nil {
+			return err
+		}
+		if oldPrefix.version != prefix.version {
+			return fmt.Errorf("%w: unable to delete prefix:%s", ErrOptimisticLockError, prefix.Cidr)
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe redigo.Pipeliner) error {
+			pipe.HDel(ctx, namespace, prefix.Cidr)
+			return nil
+		})
+		return err
+	}
+	err := r.rdb.Watch(ctx, txf, namespace)
+	if err != nil {
+		if errors.Is(err, redigo.TxFailedErr) {
+			return Prefix{}, fmt.Errorf("%w: unable to delete prefix:%s", ErrOptimisticLockError, prefix.Cidr)
+		}
+		return Prefix{}, err
 	}
 	return *prefix.deepCopy(), nil
 }

@@ -103,10 +103,17 @@ func (f *file) getModTime() time.Time {
 //
 // see ipamer.NamespacedLoad for alternative implementation candidate
 // after https://github.com/metal-stack/go-ipam/issues/111 is addressed
-func (f *file) reload(ctx context.Context) (err error) {
+//
+// When force is true the modification time shortcut is skipped and the state is
+// always re-read from disk. This is used to roll back the in-memory view after a
+// failed persist, ensuring a failed save never leaves the in-memory view ahead
+// of the file.
+func (f *file) reload(ctx context.Context, force bool) (err error) {
 	// don't do anything when file modification time didn't changed
-	if modTime := f.getModTime(); !modTime.Equal(nullModTime) && modTime.Equal(f.modTime) {
-		return nil
+	if !force {
+		if modTime := f.getModTime(); !modTime.Equal(nullModTime) && modTime.Equal(f.modTime) {
+			return nil
+		}
 	}
 
 	var data []byte
@@ -178,12 +185,55 @@ func (f *file) persist(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("failed to serialize JSON: %w", err)
 	}
-	err = os.WriteFile(f.path, data, 0600)
+	// Write to a temporary file in the same directory and atomically rename it
+	// into place: a crash or a write failure can never leave a half-written or
+	// half-deleted state file behind.
+	dir := path.Dir(f.path)
+	tmp, err := os.CreateTemp(dir, ".go-ipam-db-*.tmp")
 	if err != nil {
+		return fmt.Errorf("error creating temporary state file in %q: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	// removing the temp file is a no-op after the successful rename
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("error storing state at %q: %w", f.path, err)
+	}
+	if err = tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("error storing state at %q: %w", f.path, err)
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("error storing state at %q: %w", f.path, err)
+	}
+	if err = tmp.Close(); err != nil {
+		return fmt.Errorf("error storing state at %q: %w", f.path, err)
+	}
+	if err = os.Rename(tmpName, f.path); err != nil {
 		return fmt.Errorf("error storing state at %q: %w", f.path, err)
 	}
 	f.modTime = f.getModTime()
-	return err
+	return nil
+}
+
+// commitMutating applies mutate to the in-memory parent state and persists it.
+// If the persist fails, the in-memory view is rolled back to what is durably
+// stored on disk, so a failed save never lets the in-memory view disappear or
+// diverge ahead of the file.
+func (f *file) commitMutating(ctx context.Context, mutate func() error) error {
+	if err := mutate(); err != nil {
+		return err
+	}
+	if err := f.persist(ctx); err != nil {
+		if rerr := f.reload(ctx, true); rerr != nil {
+			//nolint:errorlint // intentionally combining two independent errors
+			return fmt.Errorf("%w (in-memory rollback after failed persist also failed: %s)", err, rerr)
+		}
+		return err
+	}
+	return nil
 }
 func (f *file) Name() string {
 	return "file"
@@ -193,7 +243,7 @@ func (f *file) CreatePrefix(ctx context.Context, prefix Prefix, namespace string
 	f.lock.Lock()
 	defer f.lock.Unlock()
 
-	if err = f.reload(ctx); err != nil {
+	if err = f.reload(ctx, false); err != nil {
 		return p, err
 	}
 
@@ -201,13 +251,20 @@ func (f *file) CreatePrefix(ctx context.Context, prefix Prefix, namespace string
 		return p, err
 	}
 
-	return p, f.persist(ctx)
+	if err = f.persist(ctx); err != nil {
+		if rerr := f.reload(ctx, true); rerr != nil {
+			//nolint:errorlint // intentionally combining two independent errors
+			return Prefix{}, fmt.Errorf("%w (in-memory rollback after failed persist also failed: %s)", err, rerr)
+		}
+		return Prefix{}, err
+	}
+	return p, nil
 }
 
 func (f *file) ReadPrefix(ctx context.Context, prefix, namespace string) (p Prefix, err error) {
 	f.lock.RLock()
 	defer f.lock.RUnlock()
-	if err = f.reload(ctx); err != nil {
+	if err = f.reload(ctx, false); err != nil {
 		return p, err
 	}
 	return f.parent.ReadPrefix(ctx, prefix, namespace)
@@ -217,20 +274,19 @@ func (f *file) DeleteAllPrefixes(ctx context.Context, namespace string) (err err
 	f.lock.RLock()
 	defer f.lock.RUnlock()
 
-	if err = f.reload(ctx); err != nil {
+	if err = f.reload(ctx, false); err != nil {
 		return err
 	}
-	if err = f.parent.DeleteAllPrefixes(ctx, namespace); err != nil {
-		return err
-	}
-	return f.persist(ctx)
+	return f.commitMutating(ctx, func() error {
+		return f.parent.DeleteAllPrefixes(ctx, namespace)
+	})
 }
 
 func (f *file) ReadAllPrefixes(ctx context.Context, namespace string) (ps Prefixes, err error) {
 	f.lock.RLock()
 	defer f.lock.RUnlock()
 
-	if err = f.reload(ctx); err != nil {
+	if err = f.reload(ctx, false); err != nil {
 		return ps, err
 	}
 	return f.parent.ReadAllPrefixes(ctx, namespace)
@@ -240,7 +296,7 @@ func (f *file) ReadAllPrefixCidrs(ctx context.Context, namespace string) (cidrs 
 	f.lock.RLock()
 	defer f.lock.RUnlock()
 
-	if err = f.reload(ctx); err != nil {
+	if err = f.reload(ctx, false); err != nil {
 		return cidrs, err
 	}
 	return f.parent.ReadAllPrefixCidrs(ctx, namespace)
@@ -250,44 +306,58 @@ func (f *file) UpdatePrefix(ctx context.Context, prefix Prefix, namespace string
 	f.lock.Lock()
 	defer f.lock.Unlock()
 
-	if err = f.reload(ctx); err != nil {
+	if err = f.reload(ctx, false); err != nil {
 		return p, err
 	}
 	if p, err = f.parent.UpdatePrefix(ctx, prefix, namespace); err != nil {
 		return p, err
 	}
-	return p, f.persist(ctx)
+	if err = f.persist(ctx); err != nil {
+		if rerr := f.reload(ctx, true); rerr != nil {
+			//nolint:errorlint // intentionally combining two independent errors
+			return Prefix{}, fmt.Errorf("%w (in-memory rollback after failed persist also failed: %s)", err, rerr)
+		}
+		return Prefix{}, err
+	}
+	return p, nil
 }
+
 func (f *file) DeletePrefix(ctx context.Context, prefix Prefix, namespace string) (p Prefix, err error) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
 
-	if err = f.reload(ctx); err != nil {
+	if err = f.reload(ctx, false); err != nil {
 		return p, err
 	}
 	if p, err = f.parent.DeletePrefix(ctx, prefix, namespace); err != nil {
 		return p, err
 	}
-	return p, f.persist(ctx)
+	if err = f.persist(ctx); err != nil {
+		if rerr := f.reload(ctx, true); rerr != nil {
+			//nolint:errorlint // intentionally combining two independent errors
+			return Prefix{}, fmt.Errorf("%w (in-memory rollback after failed persist also failed: %s)", err, rerr)
+		}
+		return Prefix{}, err
+	}
+	return p, nil
 }
 
 func (f *file) CreateNamespace(ctx context.Context, namespace string) (err error) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
 
-	if err = f.reload(ctx); err != nil {
+	if err = f.reload(ctx, false); err != nil {
 		return err
 	}
-	if err = f.parent.CreateNamespace(ctx, namespace); err != nil {
-		return err
-	}
-	return f.persist(ctx)
+	return f.commitMutating(ctx, func() error {
+		return f.parent.CreateNamespace(ctx, namespace)
+	})
 }
 
 func (f *file) ListNamespaces(ctx context.Context) (result []string, err error) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
-	if err = f.reload(ctx); err != nil {
+	if err = f.reload(ctx, false); err != nil {
 		return result, err
 	}
 	return f.parent.ListNamespaces(ctx)
@@ -297,11 +367,10 @@ func (f *file) DeleteNamespace(ctx context.Context, namespace string) (err error
 	f.lock.Lock()
 	defer f.lock.Unlock()
 
-	if err = f.reload(ctx); err != nil {
+	if err = f.reload(ctx, false); err != nil {
 		return err
 	}
-	if err = f.parent.DeleteNamespace(ctx, namespace); err != nil {
-		return err
-	}
-	return f.persist(ctx)
+	return f.commitMutating(ctx, func() error {
+		return f.parent.DeleteNamespace(ctx, namespace)
+	})
 }

@@ -18,6 +18,10 @@ type Ipamer interface {
 	NewPrefix(ctx context.Context, cidr string) (*Prefix, error)
 	// DeletePrefix delete a Prefix from a string notation.
 	// If the Prefix is not found an NotFoundError is returned.
+	// If the Prefix has allocated IPs an ErrPrefixHasIPs is returned.
+	// If the Prefix changed between the empty-check and the delete (for example
+	// because a concurrent AcquireIP committed first) an ErrOptimisticLockError
+	// is returned and the Prefix including its IPs remains untouched.
 	// This operation is scoped to the root namespace unless a different namespace is provided in the context.
 	DeletePrefix(ctx context.Context, cidr string) (*Prefix, error)
 	// AcquireChildPrefix will return a Prefix with a smaller length from the given Prefix.

@@ -170,24 +170,31 @@ func (s *sql) UpdatePrefix(ctx context.Context, prefix Prefix, namespace string)
 		_ = tx.Rollback()
 	}()
 
-	result, err := tx.ExecContext(ctx, "SELECT prefix FROM "+getTableName(namespace)+" WHERE cidr=$1 AND prefix->>'Version'=$2 FOR UPDATE", prefix.Cidr, oldVersion)
-	if err != nil {
-		return Prefix{}, fmt.Errorf("%w: unable to select for update prefix:%s", ErrOptimisticLockError, prefix.Cidr)
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return Prefix{}, err
-	}
-	if rows == 0 {
+	// Lock the candidate row (if any) and read its current version. This
+	// serializes concurrent updates and deletes of the same prefix: after the
+	// lock is released a racing delete either makes the next attempt see no row
+	// (ErrNotFound) or a racing update makes the version comparison fail
+	// (ErrOptimisticLockError).
+	var currentVersion int64
+	getErr := tx.GetContext(ctx, &currentVersion,
+		"SELECT (prefix->>'Version')::bigint FROM "+getTableName(namespace)+" WHERE cidr=$1 FOR UPDATE", prefix.Cidr)
+	if errors.Is(getErr, dbsql.ErrNoRows) {
 		// Rollback, but ignore error, if rollback is omitted, the row lock created by SELECT FOR UPDATE will not get released.
+		_ = tx.Rollback()
+		return Prefix{}, fmt.Errorf("%w: unable to update prefix:%s, prefix does not exist", ErrNotFound, prefix.Cidr)
+	}
+	if getErr != nil {
+		return Prefix{}, fmt.Errorf("unable to select prefix for update:%w", getErr)
+	}
+	if currentVersion != oldVersion {
 		_ = tx.Rollback()
 		return Prefix{}, fmt.Errorf("%w: select for update did not effect any row", ErrOptimisticLockError)
 	}
-	result, err = tx.ExecContext(ctx, "UPDATE "+getTableName(namespace)+" SET prefix=$1 WHERE cidr=$2 AND prefix->>'Version'=$3", pn, prefix.Cidr, oldVersion)
+	result, err := tx.ExecContext(ctx, "UPDATE "+getTableName(namespace)+" SET prefix=$1 WHERE cidr=$2 AND prefix->>'Version'=$3", pn, prefix.Cidr, oldVersion)
 	if err != nil {
 		return Prefix{}, fmt.Errorf("%w: unable to update prefix:%s", ErrOptimisticLockError, prefix.Cidr)
 	}
-	rows, err = result.RowsAffected()
+	rows, err := result.RowsAffected()
 	if err != nil {
 		return Prefix{}, err
 	}
@@ -202,6 +209,11 @@ func (s *sql) UpdatePrefix(ctx context.Context, prefix Prefix, namespace string)
 	return prefix, nil
 }
 
+// DeletePrefix conditionally deletes the prefix in a single transaction: the row
+// is locked by cidr and deleted only if it still has the expected version, so a
+// concurrent AcquireIP/UpdatePrefix either blocks until this transaction
+// finishes (and then loses its own optimistic-lock check) or makes this call
+// fail with ErrOptimisticLockError. A missing row is reported as ErrNotFound.
 func (s *sql) DeletePrefix(ctx context.Context, prefix Prefix, namespace string) (Prefix, error) {
 	if err := s.checkNamespaceExists(ctx, namespace); err != nil {
 		return Prefix{}, err
@@ -215,9 +227,32 @@ func (s *sql) DeletePrefix(ctx context.Context, prefix Prefix, namespace string)
 		_ = tx.Rollback()
 	}()
 
-	_, err = tx.ExecContext(ctx, "DELETE from "+getTableName(namespace)+" WHERE cidr=$1", prefix.Cidr)
+	var currentVersion int64
+	getErr := tx.GetContext(ctx, &currentVersion,
+		"SELECT (prefix->>'Version')::bigint FROM "+getTableName(namespace)+" WHERE cidr=$1 FOR UPDATE", prefix.Cidr)
+	if errors.Is(getErr, dbsql.ErrNoRows) {
+		_ = tx.Rollback()
+		return Prefix{}, fmt.Errorf("%w: unable to delete prefix:%s", ErrNotFound, prefix.Cidr)
+	}
+	if getErr != nil {
+		return Prefix{}, fmt.Errorf("unable to select prefix for delete:%w", getErr)
+	}
+	if currentVersion != prefix.version {
+		_ = tx.Rollback()
+		return Prefix{}, fmt.Errorf("%w: unable to delete prefix:%s", ErrOptimisticLockError, prefix.Cidr)
+	}
+
+	result, err := tx.ExecContext(ctx, "DELETE FROM "+getTableName(namespace)+" WHERE cidr=$1", prefix.Cidr)
 	if err != nil {
 		return Prefix{}, fmt.Errorf("unable delete prefix: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return Prefix{}, err
+	}
+	if rows == 0 {
+		_ = tx.Rollback()
+		return Prefix{}, fmt.Errorf("%w: unable to delete prefix:%s", ErrOptimisticLockError, prefix.Cidr)
 	}
 	if err := tx.Commit(); err != nil {
 		return Prefix{}, err

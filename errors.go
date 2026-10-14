@@ -11,6 +11,8 @@ var (
 	ErrAlreadyAllocated = errors.New("AlreadyAllocatedError")
 	// ErrOptimisticLockError is returned if insert or update conflicts with the existing data
 	ErrOptimisticLockError = errors.New("OptimisticLockError")
+	// ErrPrefixHasIPs is returned if a prefix with allocated IPs is attempted to be deleted
+	ErrPrefixHasIPs = errors.New("PrefixHasIPsError")
 	// ErrNamespaceDoesNotExist is returned when an operation is performed in a namespace that does not exist.
 	ErrNamespaceDoesNotExist = errors.New("NamespaceDoesNotExist")
 	// ErrNameTooLong is returned when a name exceeds the databases max identifier length

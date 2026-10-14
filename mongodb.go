@@ -227,6 +227,15 @@ func (m *mongodb) UpdatePrefix(ctx context.Context, prefix Prefix, namespace str
 		return Prefix{}, fmt.Errorf("unable to update prefix:%s, error: %w", prefix.Cidr, err)
 	}
 	if r.MatchedCount == 0 {
+		// Distinguish a concurrently deleted prefix (ErrNotFound) from a version
+		// conflict caused by a concurrent update.
+		existing := m.db.Collection(namespace).FindOne(ctx, bson.D{{Key: dbCidr, Value: prefix.Cidr}})
+		if errors.Is(existing.Err(), mongo.ErrNoDocuments) {
+			return Prefix{}, fmt.Errorf("%w: unable to update prefix:%s, prefix does not exist", ErrNotFound, prefix.Cidr)
+		}
+		if existing.Err() != nil {
+			return Prefix{}, fmt.Errorf("unable to read prefix:%s, error: %w", prefix.Cidr, existing.Err())
+		}
 		return Prefix{}, fmt.Errorf("%w: unable to update prefix:%s", ErrOptimisticLockError, prefix.Cidr)
 	}
 	if r.ModifiedCount == 0 {
@@ -245,12 +254,24 @@ func (m *mongodb) DeletePrefix(ctx context.Context, prefix Prefix, namespace str
 		return Prefix{}, err
 	}
 
-	f := bson.D{{Key: dbCidr, Value: prefix.Cidr}}
+	// Conditional delete: the document must still be at the observed version.
+	// If a concurrent AcquireIP/UpdatePrefix committed first, the filter does not
+	// match and the follow-up lookup maps the outcome to ErrOptimisticLockError;
+	// a missing document maps to ErrNotFound.
+	f := bson.D{{Key: dbCidr, Value: prefix.Cidr}, {Key: versionKey, Value: prefix.version}}
 	r := m.db.Collection(namespace).FindOneAndDelete(ctx, f)
 
-	// ErrNoDocuments should be returned if the prefix does not exist
+	// ErrNoDocuments should be returned if the prefix does not exist or if the
+	// version did not match
 	if r.Err() != nil && errors.Is(r.Err(), mongo.ErrNoDocuments) {
-		return Prefix{}, fmt.Errorf(`prefix not found:%s, error:%w`, prefix.Cidr, r.Err())
+		existing := m.db.Collection(namespace).FindOne(ctx, bson.D{{Key: dbCidr, Value: prefix.Cidr}})
+		if errors.Is(existing.Err(), mongo.ErrNoDocuments) {
+			return Prefix{}, fmt.Errorf("%w: unable to delete prefix:%s", ErrNotFound, prefix.Cidr)
+		}
+		if existing.Err() != nil {
+			return Prefix{}, fmt.Errorf(`error while trying to find prefix:%s, error:%w`, prefix.Cidr, existing.Err())
+		}
+		return Prefix{}, fmt.Errorf("%w: unable to delete prefix:%s", ErrOptimisticLockError, prefix.Cidr)
 	} else if r.Err() != nil {
 		return Prefix{}, fmt.Errorf(`error while trying to find prefix:%s, error:%w`, prefix.Cidr, r.Err())
 	}

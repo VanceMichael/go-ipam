@@ -25,6 +25,25 @@ func New(log *slog.Logger, ipamer goipam.Ipamer) *IPAMService {
 	}
 }
 
+// deletePrefixConnectError maps the ipamer DeletePrefix outcomes to stable
+// Connect/gRPC status codes:
+//   - the prefix does not exist -> CodeNotFound
+//   - the prefix still has allocated IPs -> CodeFailedPrecondition
+//   - a concurrent allocation won the race (optimistic-lock conflict) -> CodeAborted
+//   - anything else -> CodeInvalidArgument
+func deletePrefixConnectError(err error) error {
+	switch {
+	case errors.Is(err, goipam.ErrNotFound):
+		return connect.NewError(connect.CodeNotFound, err)
+	case errors.Is(err, goipam.ErrPrefixHasIPs):
+		return connect.NewError(connect.CodeFailedPrecondition, err)
+	case errors.Is(err, goipam.ErrOptimisticLockError):
+		return connect.NewError(connect.CodeAborted, err)
+	default:
+		return connect.NewError(connect.CodeInvalidArgument, err)
+	}
+}
+
 func (i *IPAMService) Version(context.Context, *v1.VersionRequest) (*v1.VersionResponse, error) {
 	return &v1.VersionResponse{
 		Version:   v.Version,
@@ -58,10 +77,7 @@ func (i *IPAMService) DeletePrefix(ctx context.Context, req *v1.DeletePrefixRequ
 	}
 	resp, err := i.ipamer.DeletePrefix(ctx, req.GetCidr())
 	if err != nil {
-		if errors.Is(err, goipam.ErrNotFound) {
-			return nil, connect.NewError(connect.CodeNotFound, err)
-		}
-		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+		return nil, deletePrefixConnectError(err)
 	}
 
 	return &v1.DeletePrefixResponse{
@@ -178,18 +194,26 @@ func (i *IPAMService) AcquireIP(ctx context.Context, req *v1.AcquireIPRequest) (
 	if req.GetIp() != "" {
 		resp, err = i.ipamer.AcquireSpecificIP(ctx, req.GetPrefixCidr(), req.GetIp())
 		if err != nil {
-			if errors.Is(err, goipam.ErrAlreadyAllocated) {
+			switch {
+			case errors.Is(err, goipam.ErrAlreadyAllocated):
 				return nil, connect.NewError(connect.CodeAlreadyExists, err)
+			case errors.Is(err, goipam.ErrNotFound):
+				return nil, connect.NewError(connect.CodeNotFound, err)
+			default:
+				return nil, connect.NewError(connect.CodeInvalidArgument, err)
 			}
-			return nil, connect.NewError(connect.CodeInvalidArgument, err)
 		}
 	} else {
 		resp, err = i.ipamer.AcquireIP(ctx, req.GetPrefixCidr())
 		if err != nil {
-			if errors.Is(err, goipam.ErrNoIPAvailable) {
+			switch {
+			case errors.Is(err, goipam.ErrNoIPAvailable):
 				return nil, connect.NewError(connect.CodeNotFound, err)
+			case errors.Is(err, goipam.ErrNotFound):
+				return nil, connect.NewError(connect.CodeNotFound, err)
+			default:
+				return nil, connect.NewError(connect.CodeInvalidArgument, err)
 			}
-			return nil, connect.NewError(connect.CodeInvalidArgument, err)
 		}
 	}
 	return &v1.AcquireIPResponse{

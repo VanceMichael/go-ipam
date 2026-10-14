@@ -151,11 +151,19 @@ func (i *ipamer) DeletePrefix(ctx context.Context, cidr string) (*Prefix, error)
 		return nil, fmt.Errorf("%w: delete prefix:%s", ErrNotFound, cidr)
 	}
 	if p.hasIPs() {
-		return nil, fmt.Errorf("prefix %s has ips, delete prefix not possible", p.Cidr)
+		return nil, fmt.Errorf("%w: prefix %s has ips, delete prefix not possible", ErrPrefixHasIPs, p.Cidr)
 	}
+	// The conditional delete is the atomic arbitration point against concurrent
+	// AcquireIP/AcquireSpecificIP: the storage only deletes while the prefix is
+	// still at the version that was observed to be empty. If an allocation commits
+	// first, the storage reports ErrOptimisticLockError and the prefix (including
+	// the newly allocated IP) stays intact. If the delete commits first, a racing
+	// allocation fails at update time with ErrNotFound and can be retried after
+	// the prefix was explicitly recreated.
+	expectedVersion := p.version
 	prefix, err := i.storage.DeletePrefix(ctx, *p, namespace)
 	if err != nil {
-		return nil, fmt.Errorf("delete prefix:%s %w", cidr, err)
+		return nil, fmt.Errorf("delete prefix:%s expected version:%d: %w", cidr, expectedVersion, err)
 	}
 
 	return &prefix, nil
@@ -403,6 +411,11 @@ func (i *ipamer) acquireAndStore(ctx context.Context, namespace string, prefix *
 	prefix.ips[ip.String()] = true
 	_, err := i.storage.UpdatePrefix(ctx, *prefix, namespace)
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			// The prefix was deleted after it was read. Do not retry: the caller
+			// must explicitly recreate the prefix before acquiring again.
+			return nil, fmt.Errorf("%w: unable to persist acquired ip:%v error:%w", ErrNotFound, prefix, err)
+		}
 		return nil, fmt.Errorf("unable to persist acquired ip:%v error:%w", prefix, err)
 	}
 	return acquired, nil
